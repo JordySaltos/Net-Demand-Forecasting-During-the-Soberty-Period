@@ -1,0 +1,3417 @@
+---
+title: "Net Demand Forecasting During the Soberty Period"
+author: "Jordy Saltos, Juan Carlos Pajares"
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    theme: sandstone
+    toc: true
+    toc_float: true
+    includes:
+      before_body: "header.html"
+    number_sections: true
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(highcharter)
+library(broom)
+library(ranger)
+library(corrplot)
+library(ggcorrplot)
+library(data.table)
+library(lightgbm)
+library(lubridate)
+library(mgcv)
+library(yarrr)
+library(magrittr)
+library(forecast)
+library(qgam)
+library(viking)
+library(patchwork)
+source("R/score.R")
+```
+
+# Objective of the Study and Methodological Framework
+
+---
+
+## Objective
+
+The main objective of this work is to predict the variable `Net_demand` in the **test dataset** 
+
+```{r, results='hide',message = FALSE}
+Data1 <- read_delim("Data/test.csv", delim=",")
+```
+
+
+by training predictive models using the information available in the **train dataset**.
+
+```{r, results='hide',message = FALSE}
+Data0 <- read_delim("Data/train.csv", delim=",")
+```
+
+The problem falls within the scope of time series forecasting, specifically in the context of net electricity demand prediction during the Soberty Period.
+
+From a statistical perspective, this is a **supervised regression problem with temporal structure**, where the response variable exhibits serial dependence and is influenced by multiple explanatory variables of different nature (meteorological, calendar-related, and operational).
+
+---
+
+## Quantile-Based Evaluation
+
+Unlike standard regression problems that minimize mean squared error, the evaluation criterion in this study is based on the **pinball loss for quantile $\tau = 0.8$**, defined as:
+
+
+$$
+L_\tau(y, \hat{y}) =
+\begin{cases}
+\tau (y - \hat{y}) & \text{if } y > \hat{y} \\
+(1-\tau)(\hat{y} - y) & \text{if } y \le \hat{y}
+\end{cases}
+$$
+
+with $\tau = 0.8$.
+
+This asymmetric loss function penalizes underestimation more heavily than overestimation, which is particularly relevant in energy systems where insufficient demand prediction may carry higher operational risks.
+
+Therefore, the objective is not to estimate the conditional mean of the demand, but rather its **conditional 80th percentile**.
+
+Formally, we seek to estimate a function:
+
+$$
+\hat{q}_{0.8}(X_t) \approx Q_{0.8}(Y_t \mid X_t)
+$$
+
+where:
+
+- $Y_t$ denotes the net demand on day $t$,
+- $X_t$ represents the set of explanatory variables available on day $t$,
+- $Q_{0.8}$ is the conditional quantile of order 0.8.
+
+Minimizing the pinball loss ensures consistent estimation of the target quantile and introduces an asymmetric penalty between underestimation and overestimation errors.
+
+---
+
+## Models Considered
+
+In order to determine the most appropriate specification, a comparative analysis will be conducted across several modeling approaches. These models differ in terms of flexibility, interpretability, and their ability to capture nonlinear relationships and interactions.
+
+The following models will be considered:
+
+---
+
+<div style="font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.5em; color: #2c3e50;"> Linear Regression </div>
+
+A classical parametric model assuming a linear relationship between the response variable and the predictors. This model will serve as a baseline reference to assess the improvement brought by more flexible approaches.
+
+---
+
+<div style="font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.5em; color: #2c3e50;"> Light Gradient Boosting (LightGBM) </div>
+
+A gradient boosting framework based on decision trees, capable of capturing nonlinear effects and complex interactions between variables. In this study, LightGBM will be implemented with a **quantile regression objective**, directly minimizing the pinball loss for the 0.8 quantile.
+
+---
+
+<div style="font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.5em; color: #2c3e50;"> Generalized Additive Models (GAM) </div>
+
+GAM models allow flexible nonlinear relationships through smooth spline functions applied to selected predictors. They are particularly suitable when variables such as temperature or time are expected to influence demand in a nonlinear but smooth manner.
+
+---
+
+<div style="font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.5em; color: #2c3e50;"> Big Additive Models (BAM) </div>
+
+BAM extends the GAM framework to efficiently handle larger datasets while maintaining the additive structure. It provides computational scalability without sacrificing model flexibility.
+
+---
+
+<div style="font-size: 1.4em; font-weight: bold; margin-top: 0.5em; margin-bottom: 0.5em; color: #2c3e50;"> AutoRegressive Integrated Moving Average (ARIMA) </div>
+
+An ARIMA model will be applied to the residuals obtained from the additive models (GAM/BAM) in order to capture any remaining serial dependence not explained by the exogenous structure. 
+This hybrid approach allows us to complement the nonlinear additive component with a parametric temporal specification, potentially improving predictive performance. A detailed explanation of this methodology will be provided in the modeling section.
+
+---
+
+The comparative evaluation of these models will allow us to assess the trade-off between:
+
+- Interpretability  
+- Functional flexibility  
+- Predictive accuracy  
+- Robustness to overfitting  
+
+The final model selection will be based on its ability to minimize the **pinball loss on validation data**, prioritizing generalization performance.
+
+----
+
+# Dataset Description and Temporal Structure
+
+## Nature of the Dataset
+
+The dataset consists of daily observations indexed by calendar date, containing net electricity demand along with multiple explanatory variables. Each observation is associated with a specific date, introducing a strict chronological ordering that must be preserved during model training and validation.
+
+Unlike standard regression problems where observations are assumed to be independent and identically distributed (i.i.d.), time series data violate this assumption. In particular:
+
+$$
+Y_t \not\perp Y_{t-1}
+$$
+
+This means that past values of demand provide relevant information for future predictions.
+
+The dataset includes both endogenous dynamics (through lag variables) and exogenous predictors such as meteorological and calendar effects.
+
+---
+
+##  Explanatory Variables
+
+The explanatory variables can be grouped into several categories.
+
+
+### Temporal Variables
+
+- `Date`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+col <- c("blue", "red", "green")
+
+
+Data1_line <- data.frame(
+  Date = Data1$Date[-395],
+  Net_demand = Data1$Net_demand.1[-1]
+)
+
+Data0_line <- Data0[, c("Date", "Net_demand")]
+Data0_line$Dataset <- "Train"
+Data1_line$Dataset <- "Test"
+plot_data <- rbind(Data0_line, Data1_line)
+
+
+x_limits <- range(c(Data0$Date, Data1$Date), na.rm = TRUE)
+
+p1 <- ggplot(plot_data, aes(x = Date, y = Net_demand, color = Dataset)) +
+  geom_line(linewidth = 0.5) +
+  scale_color_manual(values = c("Train" = "black", "Test" = col[2])) +
+  scale_x_date(limits = x_limits) +
+  labs(title = "Net Demand Over Time",
+       x = "Date", y = "Net Demand") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom")
+
+print(p1)
+
+```
+
+- `toy` (Time of Year)
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+p2a <- ggplot(Data0, aes(x = toy, y = Net_demand)) +
+  geom_point(color = col[1], size = 1, alpha = 0.7) +
+  labs(title = "Train: Demand vs toy",
+       x = "toy", y = "Net Demand") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+Data1_scatter <- data.frame(
+  toy = Data1$toy[-395],
+  Net_demand = Data1$Net_demand.1[-1]
+)
+
+p2b <- ggplot(Data1_scatter, aes(x = toy, y = Net_demand)) +
+  geom_point(color = col[2], size = 1, alpha = 0.7) +
+  labs(title = "Test: Demand vs toy",
+       x = "toy", y = "Net Demand") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p2_mix <- p2a + p2b
+print(p2_mix)
+
+```
+
+- `DLS` (Daylight Saving Indicator)
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+p3a <- ggplot(Data0, aes(x = factor(DLS), y = Net_demand)) +
+  geom_boxplot(fill = col[3], alpha = 0.7) +
+  labs(title = "Train: Demand by DLS",
+       x = "DLS", y = "Net Demand") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p3b <- ggplot(Data1, aes(x = factor(DLS), y = Net_demand.1)) +
+  geom_boxplot(fill = col[2], alpha = 0.7) +
+  labs(title = "Test: Demand by DLS",
+       x = "DLS", y = "Net Demand") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p3_mix <- p3a + p3b
+print(p3_mix)
+
+```
+
+These variables capture long-term trends, seasonality, and calendar adjustments.
+
+---
+
+### Meteorological Variables
+
+- `Temp`, `Temp_s95`,`Temp_s99`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+vars_interes <- c("Temp", "Temp_s95", "Temp_s99")
+
+vars_common <- intersect(intersect(names(Data0), names(Data1)), vars_interes)
+
+large_conjunto <- function(df, name) {
+  df %>%
+    select(Date, all_of(vars_common)) %>%
+    pivot_longer(cols = all_of(vars_common),
+                 names_to = "Features",
+                 values_to = "Value") %>%
+    mutate(Dataset = name)
+}
+
+Data0_large <- large_conjunto(Data0, "Train")
+Data1_large <- large_conjunto(Data1, "Test")
+
+ggplot() +
+  geom_line(data = Data0_large,
+            aes(x = Date, y = Value, color = Features)) +
+  geom_line(data = Data1_large,
+            aes(x = Date, y = Value),
+            color = "red", linetype = "dashed") +
+  facet_grid(Features ~ ., scales = "free_y") +
+  scale_color_manual(values = c("Temp" = "#1f77b4",
+                                "Temp_s95" = "#ff7f0e",
+                                "Temp_s99" = "#2ca02c")) +
+  labs(title = "Average Daily Temperature", x = "Date", y = "Temperature", color = "Features") +
+  theme_minimal()
+
+```
+
+- `Temp_s95_max`, `Temp_s99_max`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+vars_interes <- c("Temp_s95_max", "Temp_s99_max")
+
+vars_common <- intersect(intersect(names(Data0), names(Data1)), vars_interes)
+
+Data0_large <- large_conjunto(Data0, "Train")
+Data1_large <- large_conjunto(Data1, "Test")
+
+colores_variables <- c(
+  "Temp_s95_max" = "#d56429", 
+  "Temp_s99_max" = "#2ca02d"  
+)
+
+ggplot() +
+  geom_line(data = Data0_large,
+            aes(x = Date, y = Value, color = Features)) +
+  geom_line(data = Data1_large,
+            aes(x = Date, y = Value),
+            color = "red", linetype = "dashed") +
+  facet_grid(Features ~ ., scales = "free_y") +
+  scale_color_manual(values = colores_variables) +
+  labs(title = "Maximum Daily Temperature",x = "Date", y = "Maximum Temperature", color = "Features") +
+  theme_minimal()
+
+```
+
+- `Temp_s95_min`, `Temp_s99_min`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+vars_interes <- c("Temp_s95_min", "Temp_s99_min")
+
+vars_common <- intersect(intersect(names(Data0), names(Data1)), vars_interes)
+
+Data0_large <- large_conjunto(Data0, "Train")
+Data1_large <- large_conjunto(Data1, "Test")
+
+colores_variables <- c(
+  "Temp_s95_min" = "#d56429", 
+  "Temp_s99_min" = "#2ca02d"  
+)
+
+ggplot() +
+  geom_line(data = Data0_large,
+            aes(x = Date, y = Value, color = Features)) +
+  geom_line(data = Data1_large,
+            aes(x = Date, y = Value),
+            color = "red", linetype = "dashed") +
+  facet_grid(Features ~ ., scales = "free_y") +
+  scale_color_manual(values = colores_variables) +
+  labs(title = "Minimum Daily Temperature", x = "Date", y = "Minimum Temperature", color = "Features") +
+  theme_minimal()
+
+```
+
+- `Solar_power`, `Nebulosity`, `Nebulosity_weighted`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+Data1r <- Data1[-395,]
+Data1r$Solar_power <- Data1$Solar_power.1[-1]
+vars_interes <- c("Solar_power", "Nebulosity", "Nebulosity_weighted")
+
+vars_common <- intersect(intersect(names(Data0), names(Data1r)), vars_interes)
+
+Data0_large <- large_conjunto(Data0, "Train")
+Data1_large <- large_conjunto(Data1r, "Test")
+
+colores_variables <- c(
+  "Solar_power"          = "#fdae61", 
+  "Nebulosity"           = "#2c7bb6",  
+  "Nebulosity_weighted"  = "#1a9850"   
+)
+
+ggplot() +
+  geom_line(data = Data0_large,
+            aes(x = Date, y = Value, color = Features)) +
+  geom_line(data = Data1_large,
+            aes(x = Date, y = Value),
+            color = "red", linetype = "dashed") +
+  facet_grid(Features ~ ., scales = "free_y") +
+  scale_color_manual(values = colores_variables) +
+  labs(title = "Solar Power and Nebulosity Over Time", x = "Date", y = "Values", color = "Features") +
+  theme_minimal()
+
+```
+
+- `Wind`,`Wind_power`,`Wind_weighted`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+Data1r <- Data1r <- Data1[-395,]
+Data1r$Wind_power<- Data1$Wind_power.1[-1]
+vars_interes <- c("Wind", "Wind_power", "Wind_weighted")
+
+vars_common <- intersect(intersect(names(Data0), names(Data1r)), vars_interes)
+
+Data0_large <- large_conjunto(Data0, "Train")
+Data1_large <- large_conjunto(Data1r, "Test")
+
+colores_variables <- c(
+  "Wind"          = "#fdae61", 
+  "Wind_power"    = "#33a02c",  
+  "Wind_weighted" = "#1f78b4"   
+)
+
+ggplot() +
+  geom_line(data = Data0_large,
+            aes(x = Date, y = Value, color = Features)) +
+  geom_line(data = Data1_large,
+            aes(x = Date, y = Value),
+            color = "red", linetype = "dashed") +
+  facet_grid(Features ~ ., scales = "free_y") +
+  scale_color_manual(values = colores_variables) +
+  labs(title = "Wind and Power Over Time", x = "Date", y = "Values", color = "Features") +
+  theme_minimal()
+
+```
+
+
+Electricity demand is strongly influenced by temperature due to heating and cooling usage. The relationship is typically nonlinear, justifying the use of flexible models such as GAM or boosting-based methods.
+
+---
+
+### Lagged Variables
+
+- `Net_demand.1`
+- `Net_demand.7`
+- `Load.1`
+- `Load.7`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+
+vars_interes <- c("Net_demand.1", "Net_demand.7", "Load.1", "Load.7")
+vars_common <- intersect(intersect(names(Data0), names(Data1)), vars_interes)
+
+large_con_lags <- function(df, name) {
+  df %>%
+    select(Date, all_of(vars_common)) %>%
+    pivot_longer(cols = all_of(vars_common),
+                 names_to = "Variable",
+                 values_to = "Value") %>%
+    mutate(
+      Tipo = case_when(
+        grepl("^Net_demand", Variable) ~ "Net_demand",
+        grepl("^Load", Variable)       ~ "Load"
+      ),
+      Lag = case_when(
+        grepl("\\.1$", Variable) ~ "Lag 1",
+        grepl("\\.7$", Variable) ~ "Lag 7"
+      ),
+      Dataset = name
+    ) %>%
+    select(-Variable)
+}
+
+Data0_large <- large_con_lags(Data0, "Train")
+Data1_large <- large_con_lags(Data1, "Test")
+datos_long <- bind_rows(Data0_large, Data1_large)
+ggplot(datos_long, aes(x = Date, y = Value, color = Lag, linetype = Dataset)) +
+  geom_line() +
+  facet_grid(Tipo ~ Lag, scales = "free_y") +
+  scale_color_manual(values = c("Lag 1" = "#1f77b4", "Lag 7" = "#9467bd")) +
+  scale_linetype_manual(values = c("Train" = "solid", "Test" = "dashed")) +
+  labs(x = "Date", y = "MW", color = "Dataset", linetype = "Dataset") +
+  theme_minimal()
+
+```
+
+These variables incorporate autoregressive structure into the model:
+
+$$
+Y_t = f(Y_{t-1}, Y_{t-7}, \dots)
+$$
+
+Including lagged predictors allows the model to capture short-term persistence and weekly seasonality without explicitly specifying classical ARIMA-type models.
+
+---
+
+### Calendar and Social Structure Variables
+
+- `WeekDays`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+Data1r <- Data1[-395,]
+Data1r$Net_demand<- Data1$Net_demand.1[-1]
+Data0_clean <- Data0 %>% mutate(Dataset = "Train")
+Data1_clean <- Data1r %>% mutate(Dataset = "Test")
+
+factor_vars <- c("WeekDays", "Month", "BH", "Summer_break", "Christmas_break")
+y_var <- "Net_demand" 
+cols_interest <- c("Dataset", y_var, factor_vars)
+Data0_clean <- Data0_clean %>% select(any_of(cols_interest))
+Data1_clean <- Data1_clean %>% select(any_of(cols_interest))
+
+data <- bind_rows(Data0_clean, Data1_clean)
+
+factor_vars_present <- intersect(factor_vars, names(data))
+
+data <- data %>%
+  mutate(across(all_of(factor_vars_present), as.factor)) %>%
+  filter(!is.na(.data[[y_var]]))
+
+data <- data %>% mutate(Dataset = factor(Dataset, levels = c("Train", "Test")))
+
+var <- factor_vars_present[1]
+
+plot_data <- data %>% filter(!is.na(.data[[var]]))
+
+p <- ggplot(plot_data, aes(x = .data[[var]], y = .data[[y_var]], fill = Dataset)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+    scale_fill_manual(values = c("Train" = "darkgreen",   
+                                 "Test" = "#ff7f0e")) +
+    labs(title = paste("Distribution of", y_var, "by", var),
+         x = var, y = y_var) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+print(p)
+```
+
+- `Month`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+var <- factor_vars_present[2]
+
+plot_data <- data %>% filter(!is.na(.data[[var]]))
+
+p <- ggplot(plot_data, aes(x = .data[[var]], y = .data[[y_var]], fill = Dataset)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+    scale_fill_manual(values = c("Train" = "#9467bd",   
+                                 "Test" = "#8c564b")) +
+    labs(title = paste("Distribution of", y_var, "by", var),
+         x = var, y = y_var) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+print(p)
+```
+
+- `BH` (Bank Holidays)
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+var <- factor_vars_present[3]
+
+plot_data <- data %>% filter(!is.na(.data[[var]]))
+
+p <- ggplot(plot_data, aes(x = .data[[var]], y = .data[[y_var]], fill = Dataset)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+    scale_fill_manual(values = c("Train" = "#17becf",   
+                                 "Test" = "#bcbd22")) +
+    labs(title = paste("Distribution of", y_var, "by", var),
+         x = var, y = y_var) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+print(p)
+```
+
+- `Summer_break`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+var <- factor_vars_present[4]
+
+plot_data <- data %>% filter(!is.na(.data[[var]]))
+
+p <- ggplot(plot_data, aes(x = .data[[var]], y = .data[[y_var]], fill = Dataset)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+    scale_fill_manual(values = c("Train" = "#4d4d4d",   
+                                 "Test" = "#f15854")) +
+    labs(title = paste("Distribution of", y_var, "by", var),
+         x = var, y = y_var) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+print(p)
+```
+
+- `Christmas_break`
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=7.5, fig.height=3}
+var <- factor_vars_present[5]
+
+plot_data <- data %>% filter(!is.na(.data[[var]]))
+
+p <- ggplot(plot_data, aes(x = .data[[var]], y = .data[[y_var]], fill = Dataset)) +
+    geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+    scale_fill_manual(values = c("Train" = "#b276b2",   
+                                 "Test" = "#b2912f")) +
+    labs(title = paste("Distribution of", y_var, "by", var),
+         x = var, y = y_var) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+print(p)
+```
+
+Electricity demand reflects social and economic activity patterns, which vary according to weekdays, months, and holidays periods.
+
+---
+
+## Temporal Structure and Validation Strategy
+
+The forecasting task involves predicting future values of net demand based on historical information. Consequently, it is essential to preserve the chronological structure during model validation.
+
+Random shuffling of observations is not appropriate in this context, as it would artificially mix past and future information. Instead, validation procedures must respect temporal ordering, typically using chronological splits or forward validation schemes. 
+
+Accordingly, we will: Training on data up to 2020 
+
+```{r, results='hide'}
+sel_a <- which(Data0$Year<=2020)
+```
+
+and validating on training data from years after 2020.
+
+```{r, results='hide'}
+sel_b <- which(Data0$Year>2020)
+```
+
+----
+
+# Data Processing and Feature Engineering
+
+## Harmonization of Training and Test Sets
+
+The first step of the preprocessing stage consists of ensuring structural consistency between the training and test datasets. Since predictive models require identical feature spaces during training and inference, we restrict both datasets to their common variables.  
+
+Additionally, a numeric time index (`Time`) is constructed from the calendar date. Although the data are daily, introducing a continuous time index facilitates the modeling of long-term trends and allows parametric models to capture smooth temporal evolution.  
+
+All transformations and feature engineering procedures introduced in this section are systematically replicated on the test dataset (`Data1`) in order to preserve structural coherence and guarantee that both datasets share the exact same feature space. This ensures methodological consistency and prevents any mismatch during out-of-sample prediction.
+
+This harmonization step guarantees that:
+
+- The same predictors are available in both datasets.
+- No information leakage occurs.
+- The design matrix used for prediction is coherent across samples.
+
+```{r, results='hide'}
+Data0$Time  <- as.numeric(Data0$Date)
+Data1$Time  <- as.numeric(Data1$Date)
+vars_comm <- names(Data0)[names(Data0) %in% names(Data1)]
+vars <- c("Net_demand",vars_comm)
+Data0 <- Data0[, vars]
+Data1 <- Data1[, vars_comm]
+```
+
+---
+
+## Calendar and Structural Feature Construction
+
+Electricity demand exhibits strong calendar effects. Therefore, several deterministic temporal features are constructed to capture structured seasonal patterns.
+
+### Pandemic Indicator
+
+An indicator variable `Is_pandemic` is introduced for years 2020 and 2021. The COVID-19 pandemic generated structural breaks in electricity consumption due to changes in mobility and economic activity. Including this variable allows the model to account for regime shifts.
+
+```{r, results='hide'}
+Data0 <- Data0 %>% mutate(
+    Is_pandemic = as.factor(ifelse(Year == 2020 | Year == 2021, 1, 0)),
+    )
+```
+
+---
+
+### Temporal Partitions
+
+Variables such as:
+
+- `WeekDays`
+- `Is_weekend`
+- `Month`
+- `Quarter`
+- `Is_month_end`
+- `Is_month_beginning`
+
+```{r, results='hide'}
+Data0 <- Data0 %>% mutate(
+         Quarter = quarter(Date),
+         Month = as.factor(Month),
+         Quarter = as.factor(Quarter),
+         WeekDays = as.factor(WeekDays),
+         Is_weekend = as.factor(ifelse(WeekDays %in% c(5, 6), 1, 0)),
+         Is_month_end = as.factor(ifelse(day(Date) >= 28, 1, 0)),
+         Is_month_beginning = as.factor(ifelse(day(Date) <= 4, 1, 0)),
+         )
+```
+
+are included to capture intra-annual seasonal effects and recurring demand fluctuations related to billing cycles or economic activity.
+
+---
+
+### Holiday Effects
+
+Public holidays and school breaks significantly influence electricity consumption. Therefore, several binary indicators are introduced:
+
+- `BH`, `BH_before`, `BH_after`
+- `Holiday`
+- `Holiday_zone_a`, `Holiday_zone_b`, `Holiday_zone_c`
+- `Summer_break`
+- `Christmas_break`
+
+```{r, results='hide'}
+Data0 <- Data0 %>% mutate(
+         BH = as.factor(BH),
+         BH_before = as.factor(BH_before),
+         BH_after = as.factor(BH_after),
+         Holiday = as.factor(Holiday),
+         Holiday_zone_a = as.factor(Holiday_zone_a),
+         Holiday_zone_b = as.factor(Holiday_zone_b),
+         Holiday_zone_c = as.factor(Holiday_zone_c),
+         Summer_break = as.factor(Summer_break),
+         Christmas_break = as.factor(Christmas_break)
+         )
+```
+
+These variables allow the model to capture abrupt but recurrent deviations from regular demand levels.
+
+---
+
+### Daylight Saving Time
+
+The variable `DLS` accounts for daylight saving adjustments, which may shift daily consumption profiles.
+
+```{r, results='hide'}
+Data0 <- Data0 %>% mutate(
+         DLS = as.factor(DLS)
+         )
+```
+
+---
+
+### Cyclical Encoding of Seasonal Variables
+
+The variable `toy` (time of year) represents a periodic component. To preserve its cyclical nature, it is transformed using sine and cosine functions:
+
+$$
+\text{toy_sin} = \sin(2\pi \cdot \text{toy}), \quad
+\text{toy_cos} = \cos(2\pi \cdot \text{toy})
+$$
+
+```{r, results='hide'}
+Data0 <- Data0 %>% mutate(
+         toy_sin = sin(2 * pi * toy),
+         toy_cos = cos(2 * pi * toy)
+         )
+```
+
+This encoding ensures continuity at the boundaries of the year (e.g., December to January), avoiding artificial discontinuities that would arise from linear encoding.
+
+Cyclical transformations are particularly effective when modeling periodic phenomena.
+
+---
+
+```{r, include=FALSE}
+#Data1
+Data1 <- Data1 %>%
+  mutate(
+    Is_pandemic = as.factor(ifelse(Year == 2020 | Year == 2021, 1, 0)),
+    Quarter = quarter(Date),
+    Month = as.factor(Month),
+    Quarter = as.factor(Quarter),
+    WeekDays = as.factor(WeekDays),
+    BH = as.factor(BH),
+    BH_before = as.factor(BH_before),
+    BH_after = as.factor(BH_after),
+    Holiday = as.factor(Holiday),
+    Holiday_zone_a = as.factor(Holiday_zone_a),
+    Holiday_zone_b = as.factor(Holiday_zone_b),
+    Holiday_zone_c = as.factor(Holiday_zone_c),
+    DLS = as.factor(DLS),
+    Summer_break = as.factor(Summer_break),
+    Christmas_break = as.factor(Christmas_break),
+    Is_weekend = as.factor(ifelse(WeekDays %in% c(5, 6), 1, 0)),
+    Is_month_end = as.factor(ifelse(day(Date) >= 28, 1, 0)),
+    Is_month_beginning = as.factor(ifelse(day(Date) <= 4, 1, 0)),
+    toy_sin = sin(2 * pi * toy),
+    toy_cos = cos(2 * pi * toy)
+  )
+```
+
+
+As a baseline, we retain the data from `Data0` and `Data1` in `Data0r` and `Data1r` before the subsequent feature engineering steps are applied.
+
+```{r, results='hide'}
+Data0r <- Data0
+Data1r <- Data1
+```
+
+---
+
+## Nonlinear Transformations of Numerical Variables
+
+Electricity demand relationships are rarely strictly linear. To increase model flexibility without immediately relying on fully nonparametric methods, nonlinear transformations of numerical predictors are introduced:
+
+- Logarithmic transformations  
+- Square root transformations  
+- Squared terms  
+- Cubic terms  
+
+Formally, for a numerical variable $X$, we consider transformations of the type:
+
+$$
+\log(X), \quad \sqrt{X}, \quad X^2, \quad X^3
+$$
+
+Such polynomial and monotonic transformations enrich the feature space while remaining interpretable in linear and additive models.
+
+
+```{r, results='hide'}
+#Define the required auxiliary functions
+pow2 <- function(x){x**2}
+pow3 <- function(x){x**3}
+
+#Split into numerical and categorical features
+Numeric <- names(Data0)[sapply(Data0, is.numeric)][-1]
+Factor <- names(Data0)[sapply(Data0, is.factor)]
+Numeric_pos <- Numeric[sapply(Data0[Numeric], function(x) min(x, na.rm = TRUE) > 0)]
+
+#Apply transformations
+Data0 <- Data0 %>%
+  mutate(across(all_of(Numeric_pos), 
+                list(log = ~log(.)),
+                .names = "{.col}_log"),
+         across(all_of(Numeric_pos), 
+                list(sqrt = ~sqrt(.)),
+                .names = "{.col}_sqrt"),
+         across(all_of(Numeric), 
+                list(pow2 = ~pow2(.)),
+                .names = "{.col}_2"),
+         across(all_of(Numeric), 
+                list(pow3 = ~pow3(.)),
+                .names = "{.col}_3")
+  )
+
+```
+
+```{r,include=FALSE}
+#Data1
+Numeric <- names(Data1)[sapply(Data1, is.numeric)]
+Factor1 <- names(Data1)[sapply(Data1, is.factor)]
+Numeric_pos <- Numeric[sapply(Data1[Numeric], function(x) min(x, na.rm = TRUE) > 0)]
+
+Data1 <- Data1 %>%
+  mutate(across(all_of(Numeric_pos), 
+                list(log = ~log(.)),
+                .names = "{.col}_log"),
+         across(all_of(Numeric_pos), 
+                list(sqrt = ~sqrt(.)),
+                .names = "{.col}_sqrt"),
+         across(all_of(Numeric), 
+                list(pow2 = ~pow2(.)),
+                .names = "{.col}_2"),
+         across(all_of(Numeric), 
+                list(pow3 = ~pow3(.)),
+                .names = "{.col}_3")
+  )
+```
+
+
+---
+
+## Selection of Relevant Numerical Predictors
+
+After generating transformed variables, a correlation analysis is performed on the numerical subset of the data. The objective is not to rely solely on correlation for selection, but rather to identify predictors strongly associated with net demand.
+
+```{r,include=FALSE}
+target <- "Net_demand"
+pattern <- "Load.1"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor1 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))  
+
+pattern <- "Load.7"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor2 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))  
+
+pattern <- "Temp"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor3 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s95"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor4 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s99"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor5 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s95_min"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor6 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s95_max"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor7 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s99_min"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor8 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Temp_s99_max"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor9 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Wind"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor10 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Wind_weighted"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor11 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Nebulosity"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor12 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Nebulosity_weighted"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor13 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "toy_sin"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor14 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "toy_cos"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor15 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Year"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor16 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "BH_Holiday"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor17 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Solar_power.1"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor18 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Solar_power.7"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor19 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Wind_power.1"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor20 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Wind_power.7"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor21 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Net_demand.1"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor22 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Net_demand.7"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor23 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,            show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+pattern <- "Time"
+
+vars <- unique(c(target, grep(pattern, names(Data0), value = TRUE)))
+cor_matrix <- Data0[vars] %>% cor(use = "complete.obs")
+
+cor24 <- ggcorrplot(cor_matrix,
+           method = "square",           
+           type = "lower",             
+           lab = TRUE,                   
+           lab_size = 1,
+           show.legend  = FALSE,
+           colors = c("#67a9cf", "#f7f7f7", "#ef8a62"),
+           ggtheme = theme_minimal()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 3),
+        axis.text.y = element_text(size = 3))
+
+```
+
+
+```{r, echo=FALSE,fig.align = 'center',fig.width=8, fig.height=8}
+corplots = cor1+cor2+cor6+cor7+cor8+cor9+cor11+cor12+cor13+cor14+ cor15+cor16+cor17+cor18+cor19+cor20+cor21+cor22+cor23+cor24
+corplots = corplots + 
+  plot_annotation(
+    title = "Correlations of Net_demand with the Transformations",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  )
+print(corplots) 
+```
+
+```{r,include=FALSE}
+# We remove graphics we no longer need to free up space
+rm(cor1,cor2,cor3,cor4,cor5,cor6,cor7,cor8,cor9,cor10,cor11,cor12,cor13,cor14,cor15,cor16,cor17,cor18,cor19,cor20,cor21,cor22,cor23,cor24, corplots,p, p1,p2_mix,p2a,p2b,p3_mix,p3a,p3b,Data0_large,Data1_large)
+
+```
+
+A subset of transformed variables is retained (`VarNum`), focusing on:
+
+- Lagged demand and load variables,
+- Meteorological transformations,
+- Renewable generation variables,
+- Seasonal indicators.
+
+This intermediate selection step reduces dimensionality before interaction expansion.
+
+```{r, results='hide'}
+
+VarNum<-c("Net_demand.1","Load.1_2","Load.7_log","Net_demand.7_sqrt","Temp_s99_log",
+  "Temp_s99_max_log","Temp_s99_min_log","Temp_s95_log","Temp_s95_max_log",
+  "Temp_log","Temp_s95_min_log","Solar_power.7_log","Solar_power.1_log","toy_log",
+  "BH_Holiday","Wind_power.7_sqrt","Nebulosity_3","Nebulosity_weighted_3",
+  "Wind_power.1_sqrt","Wind_3","Wind_weighted_3")
+
+Var<-c("Net_demand","Time","Year",VarNum,Factor)
+Data0 <- Data0[, Var]
+
+```
+
+
+```{r, include=FALSE}
+#Data1
+VarNum<-c("Net_demand.1","Load.1_2","Load.7_log","Net_demand.7_sqrt","Temp_s99_log",
+          "Temp_s99_max_log","Temp_s99_min_log","Temp_s95_log","Temp_s95_max_log",
+          "Temp_log","Temp_s95_min_log","Solar_power.7_log","Solar_power.1_log","toy_log",
+          "BH_Holiday","Wind_power.7_sqrt","Nebulosity_3","Nebulosity_weighted_3",
+          "Wind_power.1_sqrt","Wind_3","Wind_weighted_3")
+
+Var<-c("Time","Year",VarNum,Factor1)
+Data1 <- Data1[, Var]
+```
+
+
+---
+
+## Interaction Terms: Multiplicative Effects
+
+To capture interaction effects between predictors, all pairwise multiplicative combinations of selected numerical variables are generated:
+
+$$
+X_i \times X_j
+$$
+
+Interaction terms allow the model to represent situations where the effect of one variable depends on the level of another. For example:
+
+- Temperature effects may vary depending on renewable production.
+- Lag effects may interact with seasonal components.
+
+Including multiplicative terms increases model expressiveness and allows linear models to approximate more complex functional relationships.
+
+
+```{r, results='hide',message=FALSE}
+#We perform this process exclusively on the numerical variables.
+comb_mult <- combn(VarNum, 2, simplify = FALSE)
+
+Data0F <- Data0
+for(combo in comb_mult) {
+  new_col <- paste(combo[1], "x", combo[2], sep = "_")
+  Data0F[[new_col]] <- Data0[[combo[1]]] * Data0[[combo[2]]]
+}
+```
+
+```{r, include=FALSE}
+#Data1
+Data1F <- Data1
+for(combo in comb_mult) {
+  new_col <- paste(combo[1], "x", combo[2], sep = "_")
+  Data1F[[new_col]] <- Data1[[combo[1]]] * Data1[[combo[2]]]
+}
+```
+
+---
+
+##  Ratio Features
+
+All possible pairwise ratios between selected numerical variables are also constructed:
+
+$$
+\frac{X_i}{X_j}, \quad i \neq j
+$$
+
+Ratio features can capture relative effects, scaling relationships, and proportional dynamics that may be more informative than absolute values.
+
+Division by zero is explicitly handled to avoid undefined values.
+
+
+```{r, results='hide',message=FALSE}
+#We perform this process exclusively on the numerical variables.
+for(i in 1:length(VarNum)) {
+  for(j in 1:length(VarNum)) {
+    if(i != j) {
+      new_col <- paste(VarNum[i], "div", VarNum[j], sep = "_")
+      Data0F[[new_col]] <- ifelse(Data0[[VarNum[j]]] !=0, Data0[[VarNum[i]]] / Data0[[VarNum[j]]],NA)
+    }
+  }
+}
+```
+
+```{r, include=FALSE}
+#Data1
+for(i in 1:length(VarNum)) {
+  for(j in 1:length(VarNum)) {
+    if(i != j) {
+      new_col <- paste(VarNum[i], "div", VarNum[j], sep = "_")
+      Data1F[[new_col]] <- ifelse(Data1[[VarNum[j]]] != 0,Data1[[VarNum[i]]] / Data1[[VarNum[j]]],NA)
+    }
+  }
+}
+```
+
+---
+
+##  Handling Missing Values
+
+Since transformations and ratios may introduce missing values (particularly due to division operations), columns containing NA values are removed.
+
+However, to accommodate nonlinear models that rely on original variables, some of the previously excluded predictors are subsequently reintroduced. This ensures a complete design matrix and guarantees numerical stability during estimation.
+
+```{r, results='hide',message=FALSE}
+# We remove the missing values
+Data0F  <- Data0F[, colSums(is.na(Data0F)) == 0]
+
+# We reintroduce the original missing features
+orig_col <- setdiff(names(Data0r), names(Data0F))
+Data0F <- cbind(Data0F, Data0r[, orig_col])
+
+```
+
+
+```{r, include=FALSE}
+#Data1
+Data1F  <- Data1F[, colSums(is.na(Data1F)) == 0]
+
+orig_col <- setdiff(names(Data1r), names(Data1F))
+Data1F <- cbind(Data1F, Data1r[, orig_col])
+```
+
+```{r, include=FALSE}
+# We ensure that they have the same number of variables
+vars_comm <- names(Data0F)[names(Data0F) %in% names(Data1F)]
+vars <- c("Net_demand",vars_comm)
+Data0F <- Data0F[, vars]
+Data1F <- Data1F[, vars_comm]
+```
+
+---
+
+## Summary
+
+Following the preprocessing and feature engineering procedures described above, the datasets `Data0F` and `Data1F` constitute the final training and test sets that will be used for the implementation of the different predictive models considered in this study.
+
+These enriched datasets incorporate newly constructed variables that were not originally present in the raw data but may contain relevant predictive information. In particular, we have introduced nonlinear transformations, interaction terms, and ratio-based features in order to capture complex dependencies beyond simple linear relationships.
+
+As a result of this feature expansion strategy, the final design matrix contains a total of 652 explanatory variables. This high-dimensional representation aims to provide sufficient flexibility for the models to detect intricate patterns in the data while preserving consistency between training and test structures.
+
+----
+
+# Linear Regression Models
+
+## Theoretical Framework and Initial Modeling Strategy
+
+We begin the modeling stage with classical linear regression in order to establish a baseline reference. Linear models provide an interpretable and theoretically grounded framework, allowing us to evaluate the predictive capacity of simple parametric structures before introducing more flexible methodologies.
+
+In this first stage, our objective is to estimate the conditional expectation of the response variable:
+
+$$
+\mathbb{E}[Y_t \mid X_t]
+$$
+
+where $Y_t$ denotes the daily net demand and $X_t$ represents the set of explanatory variables.
+
+It is important to emphasize that, at this point, we are **not directly estimating the 0.8 conditional quantile**. Instead, we focus on modeling the conditional mean as a preliminary step to understand the structure of the data and to construct our first predictive benchmarks.
+
+---
+
+## Model Assumptions
+
+The classical linear regression model is based on the following assumptions:
+
+1. **Linearity**:  
+   The relationship between the response variable and the predictors is linear in parameters:
+
+   $$
+   Y_t = \beta_0 + \sum_{j=1}^{p} \beta_j X_{jt} + \varepsilon_t
+   $$
+
+2. **Exogeneity**:  
+   The error term satisfies:
+   $$
+   \mathbb{E}[\varepsilon_t \mid X_t] = 0
+   $$
+
+3. **Homoscedasticity**:  
+   The variance of the error term is constant:
+   $$
+   \mathrm{Var}(\varepsilon_t \mid X_t) = \sigma^2
+   $$
+
+4. **No perfect multicollinearity** among predictors.
+
+5. **Independence of errors**, which in time series contexts is generally violated due to serial dependence.
+
+$$
+\varepsilon_i \perp\!\!\!\perp \varepsilon_j \quad \text{for } i \neq j
+$$
+
+Given the temporal nature of electricity demand, some of these assumptions are unlikely to hold strictly, particularly independence and homoscedasticity.
+
+---
+
+## Variable Selection in the Baseline Model
+
+In these initial linear models, we deliberately restrict the specification to the  explanatory variables available in the raw `Data0r` and `Data1r`. We use the original datasets while adding a few simple derived variables. However, we exclude features obtained through multiplications or divisions between variables, as well as nonlinear transformations such as quadratic or logarithmic terms. 
+
+This conservative specification allows us to:
+
+- Evaluate the explanatory power of the primary variables,
+- Establish a simple benchmark,
+- Understand the limitations of purely linear structures.
+
+```{r,fig.align = 'center',fig.width=7.5, fig.height=3}
+# Train data
+train=Data0r[sel_a,]%>% select(-c("Date"))
+# Validation data
+val=Data0r[sel_b,]
+# The full linear model
+model0=lm(Net_demand~.,data=train) 
+
+tidy(model0) %>%
+  filter(p.value < 0.05) %>%
+  select(term, estimate, std.error, statistic, p.value) %>% 
+  print(n = 20)
+```
+
+---
+
+## Reduced Linear Model and Out-of-Sample Evaluation
+
+After estimating the full linear specification and identifying the most statistically significant predictors through the Student's *t*-tests, we construct a reduced linear model including the variables that exhibit stronger explanatory power and economic interpretability.
+
+The objective at this stage remains the estimation of the conditional expectation of net demand, even though the final evaluation metric is based on the 0.8 quantile.
+
+### Estimation of the Reduced Linear Model
+
+We define the regression equation including the selected predictors:
+
+```{r,fig.align = 'center',fig.width=7.5, fig.height=3}
+# Define the new model
+equation1 = Net_demand ~ Time + Temp + Net_demand.1 + Net_demand.7 +
+Load.1 + Load.7 + WeekDays + Temp_s95_max + BH + BH_before +
+Wind_weighted + Year + BH_Holiday + Holiday + 
+Wind_power.7 + Is_month_beginning + Is_pandemic + toy_sin + toy_cos
+
+model1 = lm(equation1, train) 
+
+tidy(model1) %>%
+  filter(p.value < 0.0005) %>%
+  select(term, estimate, std.error, statistic, p.value) %>% 
+  print(n = 20)
+```
+
+```{r}
+# Make the Predictions with validation data
+y_hat1=predict.lm(model1,val)
+
+# Compute Pinball Loss
+pinball_loss(val$Net_demand,y_hat1,0.8) #789.7004
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = val$Net_demand,
+  Predicted = y_hat1
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#00008B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+
+```
+
+
+
+We perform variable selection again for the new model, retaining only the variables that are statistically significant according to the Student's *t*-test.
+
+```{r,fig.align = 'center',fig.width=7.5, fig.height=3}
+# Define the new model
+equation2 = Net_demand ~ Time + Temp + Net_demand.1 +
+Load.1 + WeekDays + Temp_s95_max + BH_before +
+Wind_weighted + Year + BH_Holiday + Holiday +
+Wind_power.7  + Is_pandemic + toy_sin + toy_cos
+
+model2=lm(equation2,train)
+tidy(model2) %>%
+  filter(p.value < 0.005) %>%
+  select(term, estimate, std.error, statistic, p.value) %>% 
+  print(n = 20)
+
+
+```
+
+```{r}
+# Make the Predictions with validation data
+y_hat2=predict.lm(model2,val)
+
+# Compute Pinball Loss
+pinball_loss(val$Net_demand,y_hat2,0.8)  #784.0876
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = val$Net_demand,
+  Predicted = y_hat2
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#00008B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+
+```
+
+Although we obtained a similar Pinball Loss, we managed to reduce the number of input variables, which should help decrease overfitting. However, the results remain disappointing.
+
+
+---
+
+## Quantile Adjustment via Residual Quantiles
+
+In line with the objective established at the begining, we now formalize a practical adjustment method when a pre‑trained model for the conditional mean is available.
+
+Let $(f(X_t)$ be any model estimating the conditional mean $\mathbb{E}[Y_t \mid X_t]$ , we define the residual error as $\varepsilon_t = Y_t - f(X_t)$. 
+
+The residual adjustment method relies on the translation invariance property of quantiles. The target $80$-th conditional quantile can be perfectly decomposed into the base prediction and the conditional quantile of the residuals:
+
+$$Q_{0.8}(Y_t \mid X_t) = f(X) + Q_{0.8}(\varepsilon_t \mid X_t)$$
+
+### Homoscedastic Normal Errors
+
+Assume that the residuals are independent of the covariates and follow a normal distribution with constant variance, the conditional quantile of the residuals does not depend on $X_t$ and becomes:
+
+$$
+Q_{0.8}(\varepsilon_t \mid X_t) = \sigma \cdot \Phi^{-1}(0.8)
+$$
+
+where $\Phi^{-1}(0.8)$ is the 80th percentile of the standard normal distribution.
+
+### Feasible Estimator
+
+We estimate $\mu$ and $\sigma$ by the sample mean $\bar{\varepsilon}$ and sample standard deviation $s_\varepsilon$ computed from the residuals on a validation set (to avoid overfitting). The resulting predictor for the conditional 80th percentile is:
+
+$$
+\hat{Q}_{0.8}(Y_t \mid X_t) = f(X_t) + \bar{\varepsilon} + s_\varepsilon \cdot \Phi^{-1}(0.8).
+$$
+
+Notice that the average of the residuals ($\bar{\varepsilon}$) is close to zero.
+
+---
+
+### Initial Implementation
+
+In accordance with the procedure described above, we apply it to the previous model:
+
+```{r}
+# Conditional quantile of the residuals
+y_hat2=predict.lm(model2,val)
+res <- val$Net_demand - y_hat2
+quant <- qnorm(0.8, mean= mean(res), sd= sd(res))
+
+# Compute Pinball Loss
+pinball_loss(val$Net_demand,y_hat2+quant,0.8)  #514.2901
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = val$Net_demand,
+  Predicted = y_hat2,
+  Predicted_Quantile =y_hat2+quant
+)
+
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed),
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted),
+                name = "Predicted", color = "#00008B", lineWidth = 0.8) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantile),
+                name = "Predicted_Quantile", color = "#FF0000", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE,
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+
+```
+
+
+---
+
+Finally, we use this last model trained on all of `Data0r` to make our first predictions on `Data1r`. The pinball loss will be approximated based on the lag `Net_demand.1`and the expected value of the last observation contained in `ytrue`.
+
+```{r, results='hide',message=FALSE}
+ytrue <- read_delim( file="Data/submission_test.csv", delim=",") 
+```
+
+```{r}
+# Define the new model
+model_lm=lm(equation2,Data0r)
+
+# Make the Predictions with test data
+
+y_hat_lm=predict.lm(model_lm,Data1r)
+
+#----- Detailed explanation in section 5.4 ---------#
+
+# Captures the distribution of forecasts on validation data
+dist <- ecdf(y_hat2)               
+
+#Find the probability of the test 0.8‑quantile under the validation ECDF
+q <- dist(quantile(y_hat_lm, 0.8))  #0.63
+
+# Convert that probability to a normal quantile using validation residuals 
+quant <- qnorm(q, mean = mean(res), sd = sd(res))
+
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand, y_hat_lm + quant, 0.8)  #541.858
+
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1r$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = y_hat_lm,
+  Predicted_Quantile =y_hat_lm+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed),
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted),
+                name = "Predicted", color = "#00008B", lineWidth = 0.8) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantile),
+                name = "Predicted_Quantile", color = "#FF0000", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE,
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+
+```
+
+## Conclusion
+
+Overall, linear regression does not perform well in this setting. The model is likely too simplistic to capture the underlying structure of the data. In particular, linear regression estimates the conditional expectation of the response variable under the assumption of a purely linear relationship between the predictors and the target. 
+
+However, the complexity of the phenomenon we are modeling suggests that this assumption is unrealistic. The relationship between the variables is very unlikely to be strictly linear, and therefore the model lacks the flexibility required to provide accurate predictions.
+
+For these reasons, we reject the linear regression model and turn to more flexible approaches that can better capture potential nonlinearities and interactions in the data.
+
+----
+
+# Light Gradient Boosting
+
+## Theoretical Background
+
+Light Gradient Boosting (LightGBM) is an advanced ensemble learning method based on gradient boosting decision trees. The fundamental idea behind boosting is to sequentially construct weak learners (typically decision trees), where each new model is trained to correct the errors made by the previous ones.
+
+Formally, instead of estimating the conditional mean through a single parametric structure as in linear regression, gradient boosting builds an additive model of the form:
+
+$$
+f(x) = \sum_{m=1}^{M} \gamma_m h_m(x),
+$$
+
+where each $h_m(x)$ is a regression tree and $\gamma_m$ are weights learned iteratively by minimizing a given loss function.
+
+LightGBM introduces several improvements over traditional gradient boosting:
+
+- Histogram-based tree construction for computational efficiency.
+- Leaf-wise tree growth strategy, allowing deeper and more complex trees.
+- Built-in regularization to reduce overfitting.
+- Native support for different loss functions, including quantile loss.
+
+These characteristics make LightGBM particularly suitable for high-dimensional datasets and complex nonlinear relationships, which are likely present in electricity demand time series.
+
+---
+
+## Model Implementation
+
+In this stage, we apply LightGBM using the set of predictors retained from the previous linear regression. The objective is to determine whether a nonlinear and nonparametric approach can better capture interactions and nonlinear dependencies ignored by the linear specification.
+The model is trained on the filtered training dataset `Data0F`:
+
+```{r, results='hide'}
+features = c( "Time","Temp", "Net_demand.1",
+              "Load.1","WeekDays","Temp_s95_max", "BH_before",
+              "Wind_weighted","Year","BH_Holiday","Holiday",
+              "Wind_power.7","Is_pandemic","toy_sin" ,"toy_cos")
+
+target = "Net_demand"
+
+# Feature matrix
+X = as.matrix(Data0F[, features])
+# Target
+y = Data0F[[target]]
+
+#Divide into train and test set
+X_train = X[sel_a, ]
+y_train = y[sel_a]
+X_val = X[sel_b, ]
+y_val <- y[sel_b]
+```
+
+In a first step, instead of directly fitting the model to the 0.8 conditional quantile, we estimate it under the standard regression objective in order to approximate the conditional expectation of the response variable. 
+
+This initial specification allows us to evaluate how well a nonlinear boosting model performs when targeting the mean structure of the data, before explicitly optimizing the quantile loss associated with $\tau = 0.8$.
+
+```{r}
+#Model
+dtrain <- lgb.Dataset(
+  data = X_train,
+  label = y_train
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+#Quantilic training
+#target: Conditional Mean (quantile=0.5)
+params = list(
+  objective = "quantile",
+  alpha = 0.5, 
+  metric = "quantile",
+  learning_rate = 0.07,     
+  num_leaves = 31, 
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+model.lgb1 = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+summary(model.lgb1)
+```
+
+```{r}
+#Predictions with validation data
+pred.lgb1 = predict(model.lgb1, X_val)
+#Validation Pinball Loss 
+pinball_loss(y_val,pred.lgb1,0.8) #491.2373
+
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = y_val,
+  Predicted = pred.lgb1
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#377EB8", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+
+Now we apply the same model with `Data0F` and `Data1F`, obtaining a pinball loss of:
+
+```{r, include=FALSE}
+# Train Features Matrix
+X = as.matrix(Data0F[, features])
+# Target
+y = Data0F[[target]]
+#Test Features Matrix
+X_val=as.matrix(Data1F[, features])
+y_val=NULL # Data1F dataset does not have the target variable.
+
+#Model
+dtrain <- lgb.Dataset(
+  data = X,
+  label = y
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+#Quantilic training
+#target: Conditional Mean (quantile=0.5)
+params = list(
+  objective = "quantile",
+  alpha = 0.5,              
+  metric = "quantile",
+  learning_rate = 0.07,     
+  num_leaves = 31,  
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+
+modellgb = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+summary(modellgb)
+
+```
+
+```{r}
+#Predictions with test data
+pred = predict(modellgb, X_val)
+#Test Pinball Loss 
+pinball_loss(ytrue$Net_demand,pred,0.8) #510.8432
+
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = pred
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#377EB8", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+We observe a considerable improvement compared to the linear regression models. This confirms that nonlinear interactions and hierarchical splitting structures provide a better representation of the underlying data-generating process.
+
+---
+
+## Quantile Specification
+
+Since our ultimate objective is to estimate the conditional quantile of order 0.8, we also train the model directly under the quantile loss function corresponding to $\tau = 0.8$.
+
+```{r}
+# Feature matrix
+X = as.matrix(Data0F[, features])
+# Target
+y = Data0F[[target]]
+
+#Divide into train and test set
+X_train = X[sel_a, ]
+y_train = y[sel_a]
+X_val = X[sel_b, ]
+y_val <- y[sel_b]
+#Model
+dtrain <- lgb.Dataset(
+  data = X_train,
+  label = y_train
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+# Quantile training
+# Target: 0.8 conditional quantile
+params = list(
+  objective = "quantile",
+  alpha = 0.8, 
+  metric = "quantile",
+  learning_rate = 0.07,     
+  num_leaves = 31,  
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+model.lgb1 = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+summary(model.lgb1)
+```
+
+
+```{r}
+#Predictions with validation data
+pred.lgb2 = predict(model.lgb1, X_val)
+#Validation Pinball Loss 
+pinball_loss(y_val,pred.lgb2,0.8) #439.3818
+
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = y_val,
+  Predicted_05 = pred.lgb1,
+  Predicted_08 = pred.lgb2
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_05), 
+                name = "Predicted 0.5", color = "#377EB8", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_08), 
+                name = "Predicted 0.8", color = "#FF4500", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+Now we apply the same model with Data0F and Data1F, obtaining a pinball loss of:
+
+```{r, include=FALSE}
+# Train Features Matrix
+X = as.matrix(Data0F[, features])
+# Target
+y = Data0F[[target]]
+#Test Features Matrix
+X_val=as.matrix(Data1F[, features])
+y_val=NULL # Data1F dataset does not have the target variable.
+
+#Model
+dtrain <- lgb.Dataset(
+  data = X,
+  label = y
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+## Quantile training
+# Target: 0.8 conditional quantile
+params = list(
+  objective = "quantile",
+  alpha = 0.8,              
+  metric = "quantile",
+  learning_rate = 0.07,     
+  num_leaves = 31,  
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+
+modellgb = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+summary(modellgb)
+```
+
+```{r}
+#Predictions with test data
+pred2 = predict(modellgb, X_val)
+#Test Pinball Loss
+pinball_loss(ytrue$Net_demand,pred2,0.8) # 560.1555
+
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted_05 = pred,
+  Predicted_08 = pred2
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_05), 
+                name = "Predicted 0.5", color = "#377EB8", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_08), 
+                name = "Predicted 0.8", color = "#FF4500", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+During training, the model optimized explicitly for the 0.8 quantile achieves a lower pinball loss than the model estimating the conditional expectation. This result is expected, as the objective function is aligned with the evaluation metric.
+
+Predictions are then generated on the real unseen dataset `Data1F`. However, when evaluating performance on `Data1F`, we observe the opposite behavior: the model trained under the quantile objective performs worse than the model trained to estimate the conditional mean.
+
+---
+
+## Drift Effect and Model Selection
+
+The previous phenomenon can be explained by the presence of distributional drift between the training dataset and test dataset. Drift occurs when the joint distribution of the predictors and/or the target variable changes over time.
+
+In such a context, models trained to directly optimize higher-order quantiles ($\tau = 0.8$) may become more sensitive to shifts in the upper tail of the distribution. Consequently, although the quantile objective improves in-sample performance, it may generalize poorly when the distribution of extreme values evolves.
+
+Conversely, the model trained to estimate the conditional expectation under squared loss provides more stable and consistent results between the training and testing phases.
+
+###  Quantile-Based Drift Detection and Correction
+
+To quantify and visualize the distributional drift between validation and test periods, we compare their empirical distributions and key quantiles. The following plot shows the 0.8 quantile of `Net_demand` in both periods and reveals a systematic shift:
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+# Quantile Comparison Using Observed Values
+# Compute the 0.8 quantile on validation and test actuals
+q80_val  <- quantile(Data0F[sel_b, ]$Net_demand, 0.8, na.rm = TRUE)
+q80_test <- quantile(ytrue$Net_demand, 0.8, na.rm = TRUE)
+
+# Empirical CDF of validation actuals
+dist <- ecdf(Data0F[sel_b, ]$Net_demand)
+# Find the probability level in validation that matches the test 0.8 quantile
+q <- dist(quantile(ytrue$Net_demand, 0.8))  # ~0.61
+# Corresponding validation quantile at that probability
+q61_val <- quantile(Data0F[sel_b, ]$Net_demand, q, na.rm = TRUE)
+
+# Plot
+ggplot() +
+  geom_histogram(aes(x = Net_demand, fill = "Validation"),
+                 data = Data0F[sel_b, ], alpha = 0.5, bins = 30) +
+  geom_histogram(aes(x = ytrue$Net_demand, fill = "Test"),
+                 data = Data1F, alpha = 0.5, bins = 30) +
+  geom_vline(aes(xintercept = q80_val, linetype = "Q0.8 (Validation)"), color = "blue", linewidth = 1) +
+  geom_vline(aes(xintercept = q61_val, linetype = "Q0.61 (Validation)"), color = "black", linewidth = 1) +
+  geom_vline(aes(xintercept = q80_test, linetype = "Q0.8 (Test)"), color = "red", linewidth = 1) +
+  labs(title = "Distributional Drift: Validation vs Test Actuals",
+       x = "Net Demand", y = "Count", fill = "Dataset", linetype = "Quantile") +
+  scale_fill_manual(values = c("Validation" = "blue", "Test" = "red")) +
+  scale_linetype_manual(values = c("Q0.8 (Validation)" = "dashed",
+                                   "Q0.61 (Validation)" = "solid",
+                                   "Q0.8 (Test)" = "dashed")) +
+  theme_minimal()
+```
+
+Now, because we don´t have the test actuals when generating forecasts, we instead use the model's predictions on validation and test datasets. The procedure is:
+
+- Characterize the validation prediction distribution via its empirical CDF.
+
+```{r,eval=FALSE}
+dist_pred <- ecdf(pred_val)
+```
+
+- Find where the test prediction's 0.8 quantile lies in the validation prediction distribution. This gives a probability `q` near to $0.61$.
+
+```{r,eval=FALSE}
+q <- dist_pred(quantile(pred_test, 0.8))
+```
+
+- Assuming the validation residuals `res`  are approximately normal, we compute a shift `quant` as the `q`-quantile of a normal distribution with mean and standard deviation equal to those of the validation residuals.
+
+```{r,eval=FALSE}
+quant <- qnorm(q, mean = mean(res), sd = sd(res))
+```
+
+- Add this shift to the test predictions to realign their quantile with the target.
+
+```{r,eval=FALSE}
+pinball_loss(ytrue$Net_demand, pred_test + quant, 0.8)
+```
+
+---
+
+For this reason, and given the empirical evidence observed on `Data1F`, we choose to continue working with the conditional mean specification of *LightGBM* , as it delivers more robust and stable predictive performance in the presence of potential distributional drift.
+
+----
+
+# Variable Selection via Light Gradient Boosting
+
+To enhance predictive performance and reduce model complexity, we implement a **feature selection procedure** based on Light Gradient Boosting (LightGBM). The rationale is to identify the most informative explanatory variables by evaluating their contribution to the predictive model.
+
+---
+
+## Methodology
+
+We define a custom function that performs the following steps:
+
+1. **Train an initial LightGBM model** using all available features to predict the target variable (`Net_demand`).  
+2. **Extract feature importance** from the trained model. LightGBM provides a gain-based measure, which quantifies the relative contribution of each feature to reducing the loss function during training.This approach allows us to focus on the most relevant predictors, reduce potential noise from less informative variables, and maintain interpretability.
+Cumulative gain measures the total reduction in the loss contributed by features across all trees, showing how much the top-ranked features together improve the model..  
+3. **Select top features** based on cumulative gain and correlation analysis. We retain the features that collectively contribute the majority of the predictive power, but only add a variable if it does not exhibit high correlation with those already selected to avoid multicollinearity issues. Typically, we experiment with a range of 10 to 30 variables to identify the optimal subset. (After a more in-depth study, testing each case, we concluded that using 13 variables is the most optimal choice.) 
+4. **Re-train a final model** using only the selected features, and evaluate its performance using the **pinball loss**. The subset yielding the lowest pinball loss is retained for subsequent analysis.  
+
+---
+
+## Implementation
+
+The feature selection process is encapsulated in the following function:
+
+```{r}
+train_with_feature_selection <- function(df, df1, target = "Net_demand") {
+  # Step 1: Train initial model with all features
+  dtrain <- lgb.Dataset(
+    data = as.matrix(df[, setdiff(names(df), c("Date", target))]),
+    label = df[[target]]
+  )
+  
+  dval <- lgb.Dataset(
+    data = as.matrix(df1[, setdiff(names(df1), c("Date", target))]),
+    label = df1[[target]]
+  )
+  
+  params = list(
+    objective = "quantile",
+    alpha = 0.5,              
+    metric = "quantile",
+    learning_rate = 0.05,
+    num_leaves = 31,
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    bagging_freq = 1,
+    seed = 200,
+    verbosity = -1
+  )
+  
+  model <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 4000,
+    valids = list(validation = dval),
+    early_stopping_rounds = 200,
+    verbose = 100
+  )
+  
+  # Step 2: Extract feature importance
+  imp <- lgb.importance(model, percentage = TRUE)
+  imp$cumulative_gain <- cumsum(imp$Gain)
+  
+  # Step 3: Select top features with low inter-correlation 
+  
+  cor_threshold <- 0.7 # max correlation
+  
+  # Get feature names sorted by importance (descending)
+  sorted_feats <- imp$Feature
+  
+  # Clasify the features
+  is_num <- sapply(df[, sorted_feats, drop = FALSE], is.numeric)
+  num_feats <- sorted_feats[is_num]
+  fac_feats <- sorted_feats[!is_num]
+  
+  # Compute correlation matrix for all numeric features
+  feature_data <- df[, num_feats, drop = FALSE]
+  cor_mat <- cor(feature_data, use = "pairwise.complete.obs")
+  
+  # Iterate through features in importance order
+  selected <- c()
+  for (feat in sorted_feats) {
+    if (length(selected) >= 13){break}# placeholder, adjust after evaluation
+    if (feat %in% fac_feats) {
+      selected <- c(selected, feat)                
+    } else if (feat %in% num_feats) {
+      num_sel <- intersect(selected, num_feats)    
+      if (length(num_sel) == 0) {
+        selected <- c(selected, feat)
+      } else {
+        max_cor <- max(abs(cor_mat[feat, num_sel, drop = FALSE]))
+        if (max_cor < 1){selected <- c(selected, feat)}
+      }
+    }
+  }
+  
+  selected_features <- selected 
+  
+  cat(paste("Selected", length(selected_features), 
+            "out of", ncol(df)-2, "total features\n"))
+  
+  return(list(
+    features = selected_features,
+    importance = imp
+  ))
+}
+```
+
+This function will serve as a systematic approach to identify the most relevant predictors, allowing us to reduce dimensionality while maintaining or improving predictive performance. After experimenting with subsets ranging from 10 to 30 features, we retain the set that produces the lowest pinball loss on validation data.
+
+```{r, echo=FALSE}
+result <- train_with_feature_selection(Data0F,Data1F)
+result$features
+```
+
+After identifying the most relevant variables through the *LightGBM* importance ranking, we construct and train our final Gradient Boosting model using only the predictors selected according to their importance level. This approach allows us to retain the most informative features while reducing model complexity.
+
+```{r}
+# Features Matrix
+X = as.matrix(Data0F[, result$features])
+# Target
+y = Data0F[[target]]
+
+#Divide Train-Test (Data0F)
+
+X_train = X[sel_a, ]
+y_train = y[sel_a]
+X_val = X[sel_b, ]
+y_val <- y[sel_b]
+
+# Step 4: Retrain model with selected features
+dtrain <- lgb.Dataset(
+  data = X_train,
+  label = y_train
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+# Quantile training
+params = list(
+  objective = "quantile",
+  alpha = 0.5, 
+  metric = "quantile",
+  learning_rate = 0.07,     
+  num_leaves = 31,  
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+model.lgb1 = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+```
+
+
+```{r}
+# Conditional quantile of the residuals
+pred = predict(model.lgb1, X_val)
+res <- y_val - pred
+quant <- qnorm(0.8, mean= mean(res), sd= sd(res))
+
+# Compute Pinball Loss
+pinball_loss(y_val,pred+quant,0.8) #413.1381
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = y_val,
+  Predicted = pred,
+  Predicted_Quantil = pred+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#08306B", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantil), 
+                name = "Predicted Quantil", color = "#B2182B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+After observing encouraging results on the training dataset `Data0F`, we apply the model to the unseen dataset `Data1F` in order to assess its out-of-sample performance.
+
+```{r, include=FALSE}
+# Train Features Matrix
+X = as.matrix(Data0F[, result$features])
+# Target
+y = Data0F[[target]]
+#Test Features Matrix
+X_val=as.matrix(Data1F[, result$features])
+y_val=NULL # Data1F dataset does not have the target variable.
+
+#Model
+dtrain <- lgb.Dataset(
+  data = X,
+  label = y
+)
+
+dval = lgb.Dataset(
+  data = X_val,
+  label = y_val
+)
+
+p<-0.4
+
+modellgb = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1500,
+  valids = list(validation = dval),
+  early_stopping_rounds = 100,
+  verbose = 100
+)
+
+pred1 = predict(modellgb, X_val)
+
+```
+
+
+Note that, due to the distributional drift between the training and test datasets, we select the normal quantile that best adapts to the unseen dataset `Data1F`.
+
+```{r}
+# Captures the distribution of forecasts on validation data
+dist <- ecdf(pred)               
+
+#Find the probability of the test 0.8‑quantile under the validation ECDF
+q <- dist(quantile(pred1, 0.8)) #0.63
+print(q)
+
+# Convert that probability to a normal quantile using validation residuals 
+quant <- qnorm(p, mean = mean(res), sd = sd(res))
+
+# Compute Pinball Loss 
+pinball_loss(ytrue$Net_demand,pred1+quant,0.8) #453.0213
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = pred1,
+  Predicted_Quantil = pred1+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#08306B", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantil), 
+                name = "Predicted Quantil", color = "#B2182B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+---
+
+## Conclusion
+
+Overall, the application of *LightGBM* provides a solid foundation for variable selection in our modeling framework. The feature importance analysis allows us to identify the most relevant predictors and construct a more refined set of inputs for subsequent models. This step is particularly valuable, as it reduces dimensionality while preserving the variables that contribute most to predictive performance.
+
+Compared to linear regression, the Gradient Boosting approach delivers considerably better results. The improvement confirms that nonlinear interactions and hierarchical tree-based structures capture patterns that a purely linear specification fails to model.
+
+However, despite this improvement, the model still does not provide a fully satisfactory approximation of the underlying data-generating process. Evidence suggests that the model tends to overfit the training data, especially when directly optimizing higher-order quantiles. Furthermore, the presence of distributional drift between training and test datasets weakens generalization performance, particularly in the upper tail of the distribution.
+
+As a consequence, and in light of both drift effects and stability considerations, we are ultimately compelled to continue working with the conditional expectation specification. Although less specialized than direct quantile optimization, it offers more robust and consistent results under changing distributional conditions.
+
+In summary, this stage provides a strong methodological basis for feature selection and nonlinear modeling, while highlighting the limitations imposed by overfitting and distributional instability.
+
+---
+
+# Generalized Additive Model
+
+## General Framework
+
+In this stage, we introduce a new modeling approach based on a Generalized Additive Model (GAM) with Gaussian distribution. This specification is appropriate when the response variable is continuous, can take any real value, and satisfies the assumptions of normality and constant variance—conditions that are often met after suitable transformations or when modeling phenomena with symmetric error structure.
+
+Formally, let $Y$ denote the response variable and $\boldsymbol{X} = (X_1, \ldots, X_p)^\top$ a set of predictor variables. Under the Gaussian assumption, the conditional distribution of $Y$ given $\boldsymbol{X}$ is:
+
+$$
+Y \mid \boldsymbol{X} \sim \mathcal{N}\big(\mu(\boldsymbol{X}), \sigma^2\big),
+$$
+
+where $\mu(\boldsymbol{X}) = \mathbb{E}[Y \mid \boldsymbol{X}]$ is the conditional mean and $\sigma^2$ is a constant variance parameter. The Gaussian family assumes homoskedasticity, meaning the error variance does not depend on the mean.
+
+The GAM extends the linear model by allowing the mean to depend on additive smooth functions of the predictors. Using the identity link function—the canonical link for the Gaussian family—the model is expressed as:
+
+$$
+\mu(\boldsymbol{X}) = \beta_0 + s_1(X_1) + s_2(X_2) + \cdots + s_p(X_p),
+$$
+
+where $\beta_0$ is an intercept term, and each $s_j$ is an unknown smooth function representing the potentially nonlinear effect of predictor $X_j$ on the response. These functions are estimated from the data using penalized splines or similar smoothing techniques, which balance flexibility and smoothness by incorporating a penalty into the likelihood.
+
+Estimation proceeds within a penalized maximum likelihood framework. For the Gaussian case, this is equivalent to minimizing a penalized residual sum of squares, where the penalty controls the trade-off between fidelity to the data and the smoothness of the estimated functions. This framework provides a flexible yet interpretable tool for uncovering complex covariate effects while preserving the foundational assumptions of normality and homoskedasticity that underpin classical regression theory.
+
+---
+
+## Why BAM Instead of GAM?
+
+Although GAMs provide flexible modeling capabilities, the standard `gam()` function can become computationally expensive for large datasets.
+
+Given the size of our dataset, we use the `bam()` function (Big Additive Models), which is specifically designed for large-scale data. The main advantages of `bam()` are:
+
+- Efficient computation using discretization techniques.
+- Reduced memory usage.
+- Faster estimation while preserving the theoretical properties of GAMs.
+
+Therefore, `bam()` allows us to estimate complex smooth structures while maintaining computational feasibility.
+
+---
+
+## From Gradient Boosting to the BAM Specification
+
+
+The set of predictors included in GAM is derived from the feature importance analysis obtained through LightGBM. Rather than selecting variables arbitrarily, we rely on the Gradient Boosting ranking to identify the most informative covariates.
+
+However, unlike tree-based models, which automatically capture nonlinearities and high-order interactions through recursive partitioning, a GAM/BAM requires us to specify the functional structure explicitly.
+
+---
+
+### Nonlinear Effects
+
+Continuous predictors selected by LightGBM are incorporated as smooth terms of the form:
+
+$$
+s(X_j),
+$$
+
+allowing the data to determine the appropriate nonlinear functional shape. This replaces manually engineered transformations such as quadratic or logarithmic terms (e.g., $X^2$, $\log(X)$), since spline-based smoothers can approximate these behaviors flexibly.
+
+---
+
+### Interaction Effects and Tensor Products
+
+Some variables identified as relevant in the boosting phase correspond to nonlinear interactions between predictors (for example, expressions of the form $X_1^2 \cdot \log(X_2)$). 
+
+Instead of explicitly constructing such transformed interaction variables, we model their joint effect using tensor product smooths:
+
+$$
+te(X_1, X_2).
+$$
+
+Tensor products allow flexible estimation of interactions between continuous variables while respecting potentially different scales or degrees of smoothness in each dimension. This approach is preferable to manually defining products such as $X_1 \times X_2$, $X_1^2 \times \log(X_2)$, since it:
+
+- Provides greater flexibility,
+- Avoids rigid parametric assumptions,
+- Controls complexity through penalization,
+- Improves interpretability of interaction surfaces.
+
+---
+
+### Final Additive Structure
+
+The resulting BAM specification combines:
+
+- Parametric terms for categorical variables,
+- Smooth terms $s(X_j)$ for nonlinear marginal effects,
+- Tensor product smooths $te(X_i, X_j)$ for interaction effects.
+
+In this way, the flexible nonlinear structure captured by Gradient Boosting is translated into an explicit additive formulation. This representation retains the model's flexibility while ensuring coherence with the Gaussian distributional assumption and enhancing interpretability.
+
+---
+
+## Mapping Gradient Boosting Variables to the BAM Specification
+
+As discussed previously, we now adapt the variables selected in the Gradient Boosting model to the BAM framework.
+
+In this step, each predictor retained in the boosting phase is reformulated according to the additive structure of the BAM model. The purpose is simply to translate the tree-based representation into its corresponding smooth, tensor-product, or parametric component.
+
+The following table summarizes this mapping from the Gradient Boosting variables to their final specification in the BAM model.
+
+| Gradient Boosting Term | BAM Reformulation |
+|------------------------|------------------|
+| Net_demand.1_x_Net_demand.7_sqrt | te(Net_demand.1, Net_demand.7_sqrt) |
+| Time | s(Time) |
+| Net_demand.1_x_Load.7_log | te(Net_demand.1, Load.7_log) |
+| WeekDays | Parametric term |
+| toy_cos | s(toy_cos) |
+| Temp_log | s(Temp_log) |
+| BH_Holiday_div_Net_demand.1 | te(BH_Holiday, Net_demand.1) |
+| Net_demand.1_div_Solar_power.1_log | te(Net_demand.1, Solar_power.1_log) |
+| Wind.3_div_Wind_weighted_3 | te(Wind.3, Wind_weighted_3) |
+| Load.1_2_x_Net_demand.7_sqrt | te(Load.1_2, Net_demand.7_sqrt) |
+| Wind_power.1_sqrt_div_Wind_weighted_3 | te(Wind_power.1_sqrt, Wind_weighted_3) |
+| Net_demand.7_sqrt_x_Solar_power.1_log | te(Net_demand.7_sqrt, Solar_power.1_log) |
+| Nebulosity.3_div_Nebulosity_weighted_3 | te(Nebulosity.3, Nebulosity_weighted_3) |
+
+---
+
+## Implementation
+
+### First Approach
+
+Once the additive structure has been defined, the model is implemented using BAM, which is specifically designed to handle large datasets efficiently. Continuous variables are incorporated through smooth terms, interaction effects through tensor products, and categorical variables through parametric components.
+
+```{r}
+equation0 <- Net_demand ~
+    te(Net_demand.1,Net_demand.7,Solar_power.1,by=BH_Holiday) +
+    s(Time) +
+    te(Net_demand.1,Load.7)+
+    s(toy_cos)+
+    s(Temp)+
+    te(Wind,Wind_weighted,Wind_power.1) +
+    te(Load.1,Net_demand.7) +
+    te(Nebulosity,Nebulosity_weighted) +
+    WeekDays
+g0 <- bam(equation0 , data = Data0F[sel_a,],method = "fREML")
+summary(g0)
+```
+
+```{r}
+g0.forecast<-predict(g0,  newdata= Data0F[sel_b,])
+# Compute Pinball Loss
+pinball_loss(Data0F[sel_b,]$Net_demand,g0.forecast,0.8) #464.8008
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = Data0F[sel_b,]$Net_demand,
+  Predicted = g0.forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+
+After achieving satisfactory performance on `Data0F`, we turn to the unseen `Data1F` dataset to measure the model's out-of-sample performance:
+
+
+```{r,include=FALSE}
+g1 <- bam(equation0 , data = Data0F,method = "fREML")
+```
+
+```{r}
+g1.forecast<-predict(g1,  newdata= Data1F)
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,g1.forecast,0.8) #371.4934
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = g1.forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+---
+
+### Updated GAM Equation
+
+To improve predictive accuracy, we reformulate the GAM by grouping variables of similar nature and incorporating additional factor terms. The updated model is given by:
+
+```{r, results='hide'}
+equation1 <-  Net_demand ~
+    te(Net_demand.1, Load.1, by = BH_Holiday) +
+    te(Load.1, Load.7) +
+    s(toy_sin,by =BH) +
+    te(Net_demand.7, Wind) +
+    s(Time) +
+    te(Solar_power.1, Load.1) +
+    te(Wind_power.1, Wind_weighted, Wind_power.7) +
+    te(Nebulosity, Nebulosity_weighted, by = DLS) +
+    te(Temp_s95_min, Temp_s99_min, Temp) +
+    WeekDays +
+    Holiday +
+    Is_month_beginning
+```
+
+This new specification groups related variables to capture their joint nonlinear effects efficiently. The inclusion of factor variables accounts for calendar-driven patterns. Moreover, tensor product interactions with conditioning factors allow smooth effects to vary across regimes, enhancing flexibility while preserving parsimony.
+
+```{r}
+g0 <- bam(equation1 , data = Data0F[sel_a,],method = "fREML")
+g0.forecast<-predict(g0,  newdata= Data0F[sel_b,])
+# Compute Pinball Loss
+pinball_loss(Data0F[sel_b,]$Net_demand,g0.forecast,0.8) # 419.0761
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = Data0F[sel_b,]$Net_demand,
+  Predicted = g0.forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+
+```{r, include=FALSE}
+g1 <- bam(equation1 , data = Data0F,method = "fREML")
+g1.forecast<-predict(g1,  newdata= Data1F)
+```
+
+We now turn to the model's performance on the `Data1F` dataset:
+
+```{r}
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,g1.forecast,0.8) #300.9086
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = g1.forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+---
+
+### Basis Dimension Checking and Adjustment
+
+We selected basis dimensions `k` and basis functions `bs` for each smooth term based on diagnostic results from gam.check(). 
+
+```{r}
+gam.check(g1)
+```
+
+A low `p-value` indicate insufficient basis size, especially when the degrees of freedom approaches `k`. Guided by these diagnostics and variable characteristics, we arrived at the following specification:
+
+```{r, results='hide'}
+equation2 =   Net_demand ~
+  te(Net_demand.1,Load.1,by =BH_Holiday,k=c(3,10)) +
+  te(Load.1,Load.7,k=c(10,10))+
+  s(toy_sin,by =BH, k =30)+
+  te(Net_demand.7,Wind)+
+  s(Time,k=3, bs='cr') +
+  te(Solar_power.1,Load.1) +
+  te(Wind_power.1,Wind_weighted,Wind_power.7) +
+  te(Nebulosity,Nebulosity_weighted, by=DLS) +
+  te(Temp_s95_min,Temp_s99_min,Temp)+
+  WeekDays+
+  Holiday+
+  Is_month_beginning
+```
+
+Note that, terms without explicit `k` retain default values, as diagnostics showed no evidence of undersmoothing.
+
+
+```{r, include=FALSE}
+g1 <- bam(equation2 , data = Data0F,method = "fREML")
+g1.forecast<-predict(g1,  newdata= Data1F)
+```
+
+Next, we present the pinball loss obtained on the `Data1F` dataset:
+
+```{r}
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,g1.forecast,0.8) #294.5501
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = g1.forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+---
+
+## Cross-Validation Strategy
+
+To assess the robustness and generalization ability of the proposed model, we perform cross-validation adapted to the temporal nature of the data.
+
+```{r}
+# Block Cross‑Validation 
+# Number of blocks for CV
+Nblock = 10
+# Block boundaries
+borne_block = seq(1, nrow(Data0F), length=Nblock+1)%>%floor
+# Build list of row indices for each block
+block_list = list()
+l = length(borne_block)
+for (i in c(2:(l-1)))
+{
+  block_list[[i-1]] = c(borne_block[i-1]:(borne_block[i]-1))
+}
+block_list[[l-1]] = c(borne_block[l-1]:(borne_block[l]))
+# Function to refit GAM excluding one block and forecast that block
+blockRMSE<-function(equation, block)
+{
+  g<- bam(as.formula(equation), data=Data0F[-block,],
+          method = "fREML")
+  forecast<-predict(g, newdata=Data1F)
+  return(forecast)
+} 
+# Generate out‑of‑sample forecasts for all blocks and combine
+Block_forecast<-lapply(block_list, blockRMSE, equation=equation2)%>%unlist
+Block_forecast<- Block_forecast%>%unlist%>%matrix(ncol=length(block_list), nrow=nrow(Data1F), byrow=F)
+Block_forecast<- rowMeans(Block_forecast)
+```
+
+```{r}
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,Block_forecast,0.8) #296.1689
+```
+
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = Block_forecast
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test CV)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#4169E1", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+
+Cross-validation results are used to evaluate model stability, tune smoothing penalties, and verify that the additive structure does not overfit the training data. This step is crucial to ensure reliable performance under potential distributional drift.
+
+---
+
+## Conclusion
+
+Overall, the Generalized Additive Models achieve superior predictive performance relative to both classical Linear Regression and the more complex LightGBM algorithm. This advantage stems from the model's capacity to capture nonlinear relationships and complex interaction structures through smooth additive functions, while the penalized estimation framework provides effective regularization against overfitting. The GAM thus offers a compelling balance between predictive accuracy and model transparency, preserving interpretability without sacrificing the flexibility needed to represent complex data patterns.
+
+However, diagnostic examination reveals that despite these gains in predictive performance, the residuals exhibit systematic departures from the Gaussian distributional assumption underlying the model. Asymmetry and heavier tails than expected under a true normal process indicate that while the mean structure is adequately captured, the stochastic component of the data generating process is more complex than the model accommodates. This distributional misspecification carries direct methodological consequences: the incorporation of the 0.8 quantile value for pinball loss minimization failed to yield the anticipated improvements. Such quantile-based corrections rely on well-specified conditional distributions, and when residuals deviate from normality, their theoretical optimality properties no longer hold.
+
+This calls for an alternative treatment of the residuals. In the following section, we therefore approach the problem from a temporal dependence standpoint.
+
+----
+
+#  Residual ARIMA Modeling for Quantile Predictions
+
+In quantile regression frameworks, the target of inference is the conditional quantile function $Q_{0.8}(Y_t \mid X_t)$. When this function is approximated by a generalized additive model (GAM) estimated via minimization of the pinball loss, the resulting residuals are defined as:
+
+$$
+\hat{\varepsilon}_t = Y_t - \hat{f}(X_t)
+$$
+
+Under correct specification, these residuals should satisfy the fundamental quantile property: $P(Y_t \leq \hat{f}(X_t) \mid X_t) = {0.8}$. However, this condition only ensures that the residuals are unbiased in a quantile sense—it doesn't imply they are independent over time. In time series contexts, even a well-specified quantile model may yield residuals that exhibit serial correlation, particularly when the exogenous predictors $X_t$ fail to capture all relevant temporal dynamics. This residual autocorrelation represents a predictable linear component that can be exploited to improve forecast accuracy.
+
+---
+
+## ARIMA Representation
+
+Let the true data-generating process for the conditional quantile be expressed as:
+
+$$
+Q_{0.8}(Y_t \mid X_t, \mathcal{F}_{t-1}) = f(X_t) + u_t
+$$
+
+where $\mathcal{F}_{t-1}$ denotes the sigma-algebra generated by past information (including lagged values of $Y$), and $u_t$ is a zero-mean process capturing the dynamic structure not accounted for by the contemporaneous predictors $X_t$. The observed residuals from a GAM estimated on $X_t$ alone are then:
+
+$$
+\hat{\varepsilon}_t = u_t + \nu_t
+$$
+
+where $\nu_t$ represents the irreducible quantile error (i.e., the difference between the true quantile and the realized value). Under mild conditions, $u_t$ inherits the temporal dependence structure of the underlying series.
+
+The `Wold decomposition theorem` provides the theoretical foundation for modeling such dependent processes. For any zero-mean covariance-stationary process $\{u_t\}$, there exists a representation:
+
+$$
+u_t = \sum_{j=0}^{\infty} \psi_j \eta_{t-j}, \quad \psi_0 = 1, \quad \sum_{j=0}^{\infty} \psi_j^2 < \infty
+$$
+
+where $\{\eta_t\} \sim \text{WN}(0,\sigma^2)$. This infinite-order moving average can be parsimoniously approximated by an autoregressive moving average (ARMA) model. When the process exhibits non-stationarity, differencing of order $d$ yields stationarity, leading to the ARIMA($p,d,q$) specification:
+
+$$
+\phi(B)(1-B)^d u_t = \theta(B)\eta_t
+$$
+
+Here, $\phi(B) = 1 - \phi_1 B - \cdots - \phi_p B^p$, $\theta(B) = 1 + \theta_1 B + \cdots + \theta_q B^q$, and $B$ is the backshift operator. This representation captures the linear dynamics of the omitted component $u_t$ in a compact, interpretable form.
+
+---
+
+## Estimation Strategy and Consistency
+
+Given a consistent estimate $\hat{f}(X_t)$ of the conditional quantile from the GAM stage, we obtain residuals $\hat{\varepsilon}_t$. If $\{\hat{\varepsilon}_t\}$ is stationary (or rendered so via differencing), we can identify and estimate an ARIMA model for this series, yielding:
+
+$$
+\hat{u}_{t+h} = \mathbb{E}[\hat{\varepsilon}_{t+h} \mid \hat{\varepsilon}_t, \hat{\varepsilon}_{t-1}, \ldots]
+$$
+
+The combined predictor for the conditional quantile at horizon $h$ becomes:
+
+$$
+\tilde{Q}_{0.8}(Y_{t+h} \mid X_{t+h}, \mathcal{F}_t) = \hat{f}(X_{t+h}) + \hat{u}_{t+h}
+$$
+
+This two-stage estimator enjoys desirable properties. First, because the pinball loss is convex and the ARIMA forecast is a linear projection, the combined predictor remains **consistent** for the true conditional quantile when the ARIMA component correctly captures the omitted dynamics. Second, if $u_t$ is indeed linearly predictable from its past, the hybrid forecast achieves strictly lower expected pinball loss than the GAM alone. Third, the approach respects temporal causality: the ARIMA model is fitted exclusively on out-of-sample residuals , ensuring that no future information contaminates the correction.
+
+---
+
+## Train-Validation Implementation
+
+```{r}
+# Fit GAM on training set
+gam0 <- bam(equation2, data = Data0F[sel_a, ], method = "fREML") 
+# Forecast on test set
+gam0.forecast <- predict(gam0, newdata = Data0F[sel_b, ])        
+
+# Block Cross‑Validation 
+
+Nblock <- 10                                 
+borne_block <- seq(1, nrow(Data0F), length = Nblock + 1) %>% floor 
+block_list <- list()
+l <- length(borne_block)
+for (i in c(2:(l - 1))) {
+  block_list[[i - 1]] <- c(borne_block[i - 1]:(borne_block[i] - 1))
+}
+block_list[[l - 1]] <- c(borne_block[l - 1]:(borne_block[l]))
+
+blockRMSE <- function(equation, block) {
+  g <- bam(as.formula(equation), data = Data0F[-block, ],
+           method = "fREML")
+  forecast <- predict(g, newdata = Data0F[block, ])
+  return(forecast)
+}
+Block_forecast <- lapply(block_list, blockRMSE, equation = equation2) %>% unlist
+
+# Compute out‑of‑sample residuals 
+Block_residuals <- Data0F$Net_demand - Block_forecast
+
+# ARIMA Modeling 
+
+# Convert to time series (weekly)
+Block_residuals.ts <- ts(Block_residuals, frequency = 7)
+
+# Check ACF of time series                                       
+Acf(Block_residuals.ts)                                     
+
+# Automatically select ARIMA model
+fit.arima.res <- auto.arima(Block_residuals.ts,
+                            max.p = 3, max.q = 4,
+                            max.P = 2, max.Q = 2, trace = FALSE)
+# Best model: ARIMA(3,0,3)(1,0,0)[7] with zero mean
+
+# Append validation‑set residuals to the block CV residuals
+ts_res_forecast <- ts(c(Block_residuals.ts,
+                        Data0F[sel_b, ]$Net_demand - gam0.forecast),
+                      frequency = 7)
+
+# Refit the same ARIMA model to the extended series
+refit <- Arima(ts_res_forecast, model = fit.arima.res)
+
+# Extract the fitted values corresponding to the validation period
+h <- nrow(Data0F[sel_b, ])
+prevARIMA.res <- tail(refit$fitted, h)
+
+# Add ARIMA correction
+gam0.arima.forecast <- gam0.forecast + prevARIMA.res
+```
+
+```{r}
+# Compute pinball loss
+res <- Data0F[sel_b,]$Net_demand - gam0.arima.forecast
+quant <- qnorm(0.8, mean= mean(res), sd= sd(res))
+pinball_loss(Data0F[sel_b, ]$Net_demand, gam0.arima.forecast+quant, 0.8) #286.3124
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = val$Date,
+  Observed = Data0F[sel_b, ]$Net_demand,
+  Predicted = gam0.arima.forecast,
+  Predicted_Quantil = gam0.arima.forecast+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Validation)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#6495ED", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantil), 
+                name = "Predicted Quantil", color = "#CD5C5C", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+After fitting the residuals with ARIMA and adding them to the forecasts, incorporating the quantile value 0.8 to minimize pinball loss is no longer an issue. Therefore, the next step is to apply this improved approach to the test dataset, Data1F.
+
+---
+
+## Results on Test Dataset
+
+```{r}
+# ARIMA Modeling 
+
+# Append test‑set residuals to the block CV residuals
+ts_res_forecast <- ts(c(Block_residuals.ts,
+                        ytrue$Net_demand-g1.forecast),frequency= 7)
+
+# Refit the same ARIMA model to the extended series
+refit <- Arima(ts_res_forecast, model = fit.arima.res)
+
+# Extract the fitted values corresponding to the validation period
+h <- nrow(Data1F)
+prevARIMA.res <- tail(refit$fitted, h)
+
+# Add ARIMA correction
+gam1.arima.forecast <- g1.forecast + prevARIMA.res
+```
+
+```{r}
+# Compute pinball loss
+pinball_loss(ytrue$Net_demand,gam1.arima.forecast,0.8) #343.2721
+```
+
+We incorporate the $0.63$‑th quantile of validation residuals to offset the effect of drift.
+
+```{r}
+# Captures the distribution of forecasts on validation data
+dist <- ecdf(pred)               
+
+#Find the probability of the test 0.8‑quantile under the validation ECDF
+q <- dist(quantile(pred1, 0.8)) #0.63
+print(q)
+# Convert that probability to a normal quantile using validation residuals 
+quant <- qnorm(q, mean = mean(res), sd = sd(res))
+
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,gam1.arima.forecast+quant,0.8) #290.6037
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = pred1,
+  Predicted_Quantil = pred1+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#6495ED", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantil), 
+                name = "Predicted Quantil", color = "#CD5C5C", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+In contrast to the results on `Data0F`, the application to `Data1F` achieved only a slight improvement in pinball loss.
+
+---
+
+## Conclusion
+
+The GAM–ARIMA hybrid demonstrated that modeling residual autocorrelation can substantially improve quantile predictions, as evidenced by the strong results on `Data0F`. However, the negligible improvement on `Data1F` underscores a key insight: linear temporal dependencies, even when correctly specified, may not generalize across data regimes.
+
+This finding suggests that the residual structure likely contains nonlinear components that ARIMA cannot capture. **LightGBM**, originally evaluated for its predictive performance, emerges as a natural candidate to address this gap. Its ability to learn complex patterns without pre-specified functional forms makes it well-suited to model residuals that may exhibit both temporal and nonlinear behavior. We therefore return to LightGBM as the next step in our modeling strategy.
+
+----
+
+#  Residual Light GBM for Quantile Predictions
+
+The hybrid GAM–ARIMA framework captures linear temporal dependencies in the residuals but may overlook nonlinear patterns that could further enhance quantile forecasts. Gradient boosting machines, such as LightGBM, offer a flexible non‑parametric approach to model complex, potentially nonlinear relationships without strong distributional assumptions. By applying LightGBM to the out‑of‑sample residuals obtained from block cross‑validation, we aim to learn a correction term $\hat{r}_t$ that extracts any remaining predictable signal, thereby refining the GAM‑based quantile predictions beyond a linear correction.
+
+## Light GBM Representation
+
+Let the true conditional quantile be decomposed as
+
+$$
+Q_{0.8}(Y_t \mid X_t, \mathcal{F}_{t-1}) = f(X_t) + r_t,
+$$ 
+where $f(\cdot)$ is the GAM approximation and $r_t$ represents the predictable component not captured by $X_t$. The observed residuals $\hat{\varepsilon}_t = Y_t - \hat{f}(X_t) = r_t + \nu_t$ (with $\nu_t$ having zero conditional quantile) serve as the target for a flexible learner. LightGBM is trained to predict $\hat{\varepsilon}_t$ using a feature vector $\mathbf{Z}_{t}$ that includes lagged variables and calendar information.
+$$
+\hat{r}t = \text{LightGBM}(\epsilon_t \mid Z_{t})
+$$ 
+
+By minimizing the pinball loss with $\tau = 0.8$, the model directly estimates the conditional quantile of the residual, yielding $\hat{r}_t$. The final hybrid forecast is then $\tilde{Y}_t = \hat{f}(X_t) + \hat{r}_t$.
+
+---
+
+## Implementation
+
+
+To avoid look‑ahead bias, we first generate out‑of‑sample GAM residuals using 10‑fold block cross‑validation. For each block, a GAM is estimated on all data except that block, and predictions are made on the test set `Data1` (for `blockRMSE`) or on the full training set (for `blockRMSE0`). Averaging across blocks yields `Block_forecast` (test set predictions) and `Block_forecast0` (training set predictions). The residuals are then computed as the difference between observed net demand and these block‑averaged forecasts, stored in `Data0s$Gam_res` and `Data1s$Gam_res`. These residuals are truly out‑of‑sample and serve as the target for the LightGBM model.
+
+```{r}
+# Step 1: Out‑of‑Sample GAM Residuals via Block Cross‑Validation 
+
+# Cross‑Validation
+Nblock <- 10
+borne_block <- seq(1, nrow(Data0F), length = Nblock + 1) %>% floor
+block_list <- list()
+l <- length(borne_block)
+for (i in c(2:(l - 1))) {
+  block_list[[i - 1]] <- c(borne_block[i - 1]:(borne_block[i] - 1))
+}
+block_list[[l - 1]] <- c(borne_block[l - 1]:(borne_block[l]))
+
+# Function to refit GAM excluding a block and predict on the test set (Data1)
+blockRMSE <- function(equation, block) {
+  g <- bam(as.formula(equation), data = Data0F[-block, ],
+           method = "fREML", rho = -0.14,
+           family = gaussian(link = "identity"))
+  predict(g, newdata = Data1F)
+}
+Block_forecast <- lapply(block_list, blockRMSE, equation = equation2) %>%
+  unlist() %>% matrix(ncol = length(block_list), nrow = nrow(Data1F), byrow = FALSE) %>%
+  rowMeans()
+
+# Function to refit GAM excluding a block and predict on the training set (Data0)
+blockRMSE0 <- function(equation, block) {
+  g <- bam(as.formula(equation), data = Data0F[-block, ],
+           method = "fREML", rho = -0.14,
+           family = gaussian(link = "identity"))
+  predict(g, newdata = Data0F)
+}
+Block_forecast0 <- lapply(block_list, blockRMSE0, equation = equation2) %>%
+  unlist() %>% matrix(ncol = length(block_list), nrow = nrow(Data0F), byrow = FALSE) %>%
+  rowMeans()
+
+# Store the out‑of‑sample residuals as new variables
+Data0s <- Data0F
+# Residuals for training period
+Data0s$Gam_res <- Data0F$Net_demand - Block_forecast0   
+Data1s <- Data1F
+# Residuals for test period 
+Data1s$Gam_res <- ytrue$Net_demand - Block_forecast   
+```
+
+The LightGBM model is trained to predict the out‑of‑sample residuals using a set of temporally relevant features. The quantile objective with $alpha = 0.8$ ensures that the model learns the conditional 0.8‑quantile of the residuals given the past.
+
+```{r}
+# Step 2: LightGBM Training on Residuals
+
+# Define features for the boosting model
+features <- c("WeekDays", "Time", "Net_demand.1", "Load.1", 
+              "Wind", "Is_month_beginning","Is_pandemic")
+target <- "Gam_res"
+
+# Create LightGBM datasets
+dtrain_selected <- lgb.Dataset(
+  data = as.matrix(Data0s[, features]),
+  label = Data0s[[target]]
+)
+dval_selected <- lgb.Dataset(
+  data = as.matrix(Data1s[, features]),
+  label = Data1s[[target]]
+)
+
+# Set hyperparameters with quantile objective (τ = 0.8)
+params <- list(
+  objective = "quantile",
+  alpha = 0.8,
+  metric = "quantile",
+  learning_rate = 0.07,
+  num_leaves = 31,
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 1,
+  verbosity = -1
+)
+
+# Train the model
+model_final <- lgb.train(
+  params = params,
+  data = dtrain_selected,
+  nrounds = 2000,
+  valids = list(validation = dval_selected),
+  early_stopping_rounds = 200,
+  verbose = 100
+)
+```
+
+The trained **LightGBM** model produces predictions `pred_test` that estimate the conditional quantile of the residual for the test period. Adding these back to the original GAM forecasts `Block_forecast` yields the final hybrid forecast `ypred_test`. The pinball loss is then computed to evaluate the improvement over the baseline.
+
+```{r, include=FALSE}
+# Data Train Residuals
+X_val=as.matrix(Data0s[,features])
+pred = predict(model_final, X_val)
+ypred0 = pred+Block_forecast0
+res <- Data0F$Net_demand - ypred0
+```
+
+```{r}
+# Step 3: Generate Hybrid Forecasts 
+# Predict on test set features
+X_val <- as.matrix(Data1s[, features])
+pred_test <- predict(model_final, X_val)
+
+# Combine with GAM forecasts
+ypred_test <- pred_test + Block_forecast
+# Captures the distribution of forecasts on validation data
+dist <- ecdf(ypred0)               
+
+#Find the probability of the test 0.8‑quantile under the validation ECDF
+q <- dist(quantile(ypred_test, 0.8)) #0.57
+print(q)
+# Convert that probability to a normal quantile using validation residuals 
+quant <- qnorm(q, mean = mean(res), sd = sd(res))
+
+# Compute Pinball Loss
+pinball_loss(ytrue$Net_demand,ypred_test+quant,0.8) # 271.6034
+```
+
+```{r,echo=FALSE,fig.align = 'center',fig.width=8, fig.height=6}
+
+# Observed vs predicted values Dataset
+plot_data <- data.frame(
+  Date    = Data1F$Date,
+  Observed = ytrue$Net_demand,
+  Predicted = ypred_test,
+  Predicted_Quantil = ypred_test+quant
+)
+
+# Plot
+highchart() %>%
+  hc_title(text = "Observed vs. Predicted Net Demand (Test)",
+           style = list(fontSize = "16px")) %>%
+  hc_xAxis(title = list(text = "Date"), type = "datetime") %>%
+  hc_yAxis(title = list(text = "Net demand")) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Observed), 
+                name = "Observed", color = "black", lineWidth = 0.5) %>%
+  hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted), 
+                name = "Predicted", color = "#483D8B", lineWidth = 0.8) %>%hc_add_series(plot_data, "line", hcaes(x = Date, y = Predicted_Quantil), 
+                name = "Predicted Quantil", color = "#800000", lineWidth = 0.8) %>%
+  hc_tooltip(shared = TRUE, 
+             pointFormat = '<span style="color:{point.color}">\u25CF</span> {series.name}: {point.y:.2f}<br/>') %>%
+  hc_legend(enabled = TRUE,align = "center", verticalAlign = "top",
+            itemStyle = list(fontSize = "10px"))%>%
+  hc_exporting(enabled = TRUE)%>%    hc_chart(zoomType = "x")
+```
+
+
+## Conclusion
+
+In summary, addressing the residuals through a LightGBM-based approach proved highly effective. We achieved a substantial improvement in pinball loss compared to the previous model, ultimately attaining a score of **271.6034** on the test dataset `Data1F`.
+
+Nevertheless, opportunities for further refinement remain. Future work could explore interactions among more than three variables in the GAM models or implement online aggregation of experts via the opera package to combine our best models, potentially driving the pinball loss even lower.
+
+
