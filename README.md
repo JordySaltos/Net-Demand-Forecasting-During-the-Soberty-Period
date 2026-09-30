@@ -2,7 +2,7 @@
 
 Forecasting of daily **net electricity demand** during the sobriety period, using a hybrid approach that combines Generalized Additive Models (GAM/BAM), ARIMA and LightGBM. The goal is to estimate the **conditional 80th percentile** of demand, evaluated with the **pinball loss (τ = 0.8)**.
 
-**Academic project:** developed as part of the first year (M1) of the Master's in Mathematics and Artificial Intelligence. This work achieved the **best score of the cohort** in the forecasting challenge and the **highest grade of the class (18/20)**.
+**Academic project:** developed as part of the first year (M1) of the Master's in Mathematics and Artificial Intelligence. This work achieved the **best score in the class** in the forecasting challenge and the **highest grade of the year group (18/20)**.
 
 **Authors:** Jordy Saltos, Juan Carlos Pajares
 
