@@ -4,7 +4,7 @@ Forecasting of daily **net electricity demand** during the sobriety period, usin
 
 **Academic project:** developed as part of the first year (M1) of the Master's in Mathematics and Artificial Intelligence at Paris-Saclay University. This work achieved the **best score in the class** in the forecasting challenge and the **highest grade of the year group (18/20)**.
 
-**Authors:** Jordy Saltos, Juan Carlos Pajares
+**Authors:** Jordy Saltos and Juan Carlos Pajares
 
 ---
 
